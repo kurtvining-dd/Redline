@@ -37,6 +37,8 @@
 // @match        https://console.aws.amazon.com/*
 // @match        https://*.aws.amazon.com/oauth*
 // @match        https://*.awsapps.com/start*
+// @match        https://grafana.doordash.team/*
+// @match        https://obs.doordash.team/*
 // @connect      speedrun-api.us-west-2.nobackspacecrew.com
 // @connect      speedrun-api-beta.us-west-2.nobackspacecrew.com
 // @connect      lambda.us-east-1.amazonaws.com
@@ -945,6 +947,109 @@ function unescapeCloudwatchInsights(s) {
 //console.log(unescapeCloudwatchInsights(unescapeCloudwatch("#metricsV2:graph=~(view~'timeSeries~stacked~false~metrics~(~(~(expression~'SEARCH*28*27*7bAWS*2fApiGateway*2cApiName*7d*27*2c*20*27Average*27*2c*20300*29~id~'e1~period~300))~(~'AWS*2fApiGateway~'4XXError~'ApiName~'dev-serverless-api-sample~(id~'m1)))~region~'us-west-2~stat~'Average~period~300~start~'2022-04-14T20*3a13*3a00.988Z~end~'2022-04-14T20*3a26*3a00.741Z);query=~'*7bAWS*2fApiGateway*2cApiName*7d")));
 //console.log(unescapeCloudwatchInsights(unescapeCloudwatch("#metricsV2:graph=~(region~'us-east-1~metrics~(~(~'AWS*2fLambda~'Throttles~'FunctionName~'IsRecyclingWeek~(stat~'Sum)))~view~'timeSeries~stacked~false~start~'2022-04-19T20*3a41*3a00.000Z~end~'2022-04-19T21*3a22*3a00.000Z~period~60~annotations~(horizontal~(~(label~'Throttles*20*3e*200*20for*201*20datapoints*20within*201*20minute~value~0)))~title~'Lambda-Throttles)")));
 
+// Grafana parsing functions
+function isGrafanaHost(hostname) {
+    return hostname === 'grafana.doordash.team' || hostname === 'obs.doordash.team';
+}
+
+function extractGrafanaTimestamp(url) {
+    try {
+        const urlObj = new URL(url);
+        const panesParam = urlObj.searchParams.get('panes');
+
+        if (!panesParam) {
+            return null;
+        }
+
+        // Parse JSON (already URL-decoded by searchParams.get)
+        const panes = JSON.parse(panesParam);
+
+        // Iterate over all pane IDs (random strings like "ypi", "0hg")
+        for (let paneId in panes) {
+            const pane = panes[paneId];
+            if (pane && pane.range && pane.range.from && pane.range.to) {
+                return {
+                    from: pane.range.from,
+                    to: pane.range.to,
+                    paneId: paneId  // For debugging
+                };
+            }
+        }
+
+        return null;
+    } catch (error) {
+        console.log('Failed to parse Grafana URL:', error);
+        return null;
+    }
+}
+
+function parseGrafanaDuration(grafanaTime) {
+    // Parse "now-1h", "now-15m", "now-30d" into seconds
+    // Input: "now-1h"
+    // Returns: -3600
+    if (!grafanaTime || grafanaTime === "now") {
+        return 0; // "now" = 0
+    }
+
+    const match = grafanaTime.match(/now-(\d+)([smhdw])/);
+    if (!match) return 0;
+
+    const value = parseInt(match[1]);
+    const unit = match[2];
+    const multipliers = {s: 1, m: 60, h: 3600, d: 86400, w: 604800};
+    return -value * (multipliers[unit] || 1);
+}
+
+function formatGrafanaTimeLabel(from, to) {
+    // Handle "now" endpoint
+    if (to !== "now" && !to.startsWith('now')) {
+        // Fixed timestamp, handle separately
+        return formatGrafanaFixedLabel(from, to);
+    }
+
+    // Parse relative format
+    if (from === "now") {
+        return "now";
+    }
+
+    const match = from.match(/now-(\d+)([smhdw])/);
+    if (!match) {
+        return `${from} to ${to}`;
+    }
+
+    const value = parseInt(match[1]);
+    const unit = match[2];
+    const unitMap = {
+        s: 'second',
+        m: 'minute',
+        h: 'hour',
+        d: 'day',
+        w: 'week'
+    };
+
+    const unitName = unitMap[unit] || unit;
+    const plural = value > 1 ? 's' : '';
+
+    return `${value} ${unitName}${plural} ago`;
+}
+
+function formatGrafanaFixedLabel(from, to) {
+    // Handle absolute timestamps (Unix milliseconds)
+    // Convert to human-readable format
+    try {
+        const fromMs = parseInt(from);
+        const toMs = parseInt(to);
+
+        if (!isNaN(fromMs) && !isNaN(toMs)) {
+            return `${dayjs(fromMs).format('YYYY-MM-DD HH:mm')} - ${dayjs(toMs).format('YYYY-MM-DD HH:mm')}`;
+        }
+
+        return `${from} - ${to}`;
+    } catch (e) {
+        return `${from} - ${to}`;
+    }
+}
+
 function getFormattedTimeUnit(relativeTimeInSeconds) {
     const rtf = new Intl.RelativeTimeFormat("en", { numeric: "auto" });
     let mapping = [{month:relativeTimeInSeconds/30/24/3600},
@@ -1075,9 +1180,9 @@ function extractCloudWatchTimeAndAddSnapshot() {
         timestamp.end = end;
         if(timeType === 'RELATIVE'){
             timestamp.type = 'relative';
-            timestamp.label = `${getFormattedTimeUnit(convertDuration(start))} - ${getFormattedTimeUnit(convertDuration(end))}`;
+            timestamp.label = `${getFormattedTimeUnit(convertDuration(start))} - ${getFormattedTimeUnit(convertDuration(end))} (CloudWatch)`;
         }else{
-            timestamp.label = `${timestamp.start} - ${timestamp.end}`.replace(/T/g,' ').replace(/\.\d{3}Z/g,'Z');
+            timestamp.label = `${timestamp.start} - ${timestamp.end}`.replace(/T/g,' ').replace(/\.\d{3}Z/g,'Z') + ' (CloudWatch)';
             timestamp.type = 'fixed';
         }
         if(timestamp.label) {
@@ -1130,6 +1235,42 @@ function extractCloudWatchTimeAndAddSnapshot() {
                 }
             );
         });
+    }
+}
+
+function extractGrafanaTimeAndAddSnapshot() {
+    // Check if we're on a Grafana page
+    if (!isGrafanaHost(window.location.hostname)) {
+        return;
+    }
+
+    // Only process /explore paths
+    if (!/^\/explore/.test(window.location.pathname)) {
+        return;
+    }
+
+    let timeRange = extractGrafanaTimestamp(window.location.href);
+    if (!timeRange || !timeRange.from || !timeRange.to) {
+        return;
+    }
+
+    let timestamp = {};
+    timestamp.start = timeRange.from;
+    timestamp.end = timeRange.to;
+    timestamp.source = 'grafana';  // Track source
+
+    // Determine if relative or fixed
+    if (timeRange.from.startsWith('now')) {
+        timestamp.type = 'relative';
+        timestamp.label = `${formatGrafanaTimeLabel(timeRange.from, timeRange.to)} (Grafana)`;
+    } else {
+        timestamp.type = 'fixed';
+        timestamp.label = `${formatGrafanaFixedLabel(timeRange.from, timeRange.to)} (Grafana)`;
+    }
+
+    if (timestamp.label) {
+        console.log(`Extracted ${timestamp.type} Grafana timestamp`, timestamp);
+        persistTimestamp(timestamp, TIMESTAMPS_KEY);
     }
 }
 
@@ -1241,6 +1382,22 @@ if(location.host.endsWith('console.aws.amazon.com')) {
         extractCloudWatchTimeAndAddSnapshot();
     }
     return;
+}
+
+if(location.host === 'grafana.doordash.team' || location.host === 'obs.doordash.team') {
+    // Extract on initial load
+    extractGrafanaTimeAndAddSnapshot();
+
+    // Grafana uses query parameters, not hash changes
+    if (window.onurlchange === null) {
+        // Monitor URL changes (SPA navigation)
+        window.addEventListener('urlchange', (info) => {
+            extractGrafanaTimeAndAddSnapshot();
+        });
+    } else {
+        // Fallback: use popstate for older browsers
+        window.addEventListener('popstate', extractGrafanaTimeAndAddSnapshot);
+    }
 }
 
 const ISSUES_PATH_REGEX = /\/issues\/(\d+)$/;
@@ -1590,6 +1747,14 @@ let templates = {
     stepfunctionExecution : {
         type: "federate",
         value: "states/home?region=${region}#/v2/executions/details/${executionArn?executionArn:`arn:${partition}:states:${region}:${account}:execution:${functionName}:${execution}`}"
+    },
+    GrafanaExplore: {
+        type: "link",
+        value: "https://${typeof grafanaHost === 'undefined' ? 'grafana.doordash.team' : grafanaHost}/explore?panes=${encodeURIComponent(buildGrafanaPanesJSON(typeof from === 'undefined' ? 'now-1h' : from, typeof to === 'undefined' ? 'now' : to, datasource, {refId:'A',expr:content.trim()}))}"
+    },
+    GrafanaExploreSRTimestamp: {
+        type: "link",
+        value: "https://${typeof grafanaHost === 'undefined' ? 'grafana.doordash.team' : grafanaHost}/explore?panes=${encodeURIComponent(buildGrafanaPanesJSON(grafanaFrom(), grafanaTo(), datasource, {refId:'A',expr:content.trim()}))}"
     }
 };
 
@@ -2455,7 +2620,11 @@ function srTimestamp(type="cloudwatch"){
         "cloudwatch" : {
             "relative" : () => `end~${timestamp.end}~start~${timestamp.start}~timeType~'RELATIVE~unit~'seconds`,
             "fixed" : () => `end~'${timestamp.end.replace(/(:\d\d)Z/,"$1.999Z")}~start~'${timestamp.start.replace(/(:\d\d)Z/,"$1.000Z")}~timeType~'ABSOLUTE~tz~'UTC`
-            }
+        },
+        "grafana" : {
+            "relative" : () => timestamp.start,
+            "fixed" : () => timestamp.start
+        }
     };
     let conversionFunction = nullSafe(conversionFunctionLookup[type])[timestamp.type];
     if(conversionFunction) {
@@ -2463,6 +2632,27 @@ function srTimestamp(type="cloudwatch"){
         return conversionFunction();
     }
     throw new Error(`Unsupported srTimestamp type: ${type} or format: ${timestamp.type}`);
+}
+
+function grafanaFrom() {
+    let timestamp = firstNonNull(sessionVariables.srTimestampValue, "{}");
+    return timestamp.start || "now-1h";
+}
+
+function grafanaTo() {
+    let timestamp = firstNonNull(sessionVariables.srTimestampValue, "{}");
+    return timestamp.end || "now";
+}
+
+function buildGrafanaPanesJSON(from, to, datasource, query) {
+    const paneId = Math.random().toString(36).substring(7);
+    return JSON.stringify({
+        [paneId]: {
+            datasource: datasource,
+            queries: [query],
+            range: {from: from, to: to}
+        }
+    });
 }
 
 function syntaxHighlight(json) {
@@ -2551,6 +2741,9 @@ var exposedFunctions = {
     firstNonNull: firstNonNull,
     prepend: prepend,
     srTimestamp: srTimestamp,
+    grafanaFrom: grafanaFrom,
+    grafanaTo: grafanaTo,
+    buildGrafanaPanesJSON: buildGrafanaPanesJSON,
     encodeCloudWatchInsightsParam: encodeCloudWatchInsightsParam,
     encodeCloudWatchURL: encodeCloudWatchURL,
     nullSafe: nullSafe,
