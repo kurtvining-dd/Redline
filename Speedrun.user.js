@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Speedrun
 // @namespace    https://speedrun.nobackspacecrew.com/
-// @version      1.149
+// @version      1.151
 // @description  Markdown to build tools
 // @author       No Backspace Crew
 // @require      https://speedrun.nobackspacecrew.com/js/jquery@3.7.1/jquery-3.7.1.min.js
@@ -1750,11 +1750,11 @@ let templates = {
     },
     GrafanaExplore: {
         type: "link",
-        value: "https://${typeof grafanaHost === 'undefined' ? 'grafana.doordash.team' : grafanaHost}/explore?panes=${encodeURIComponent(buildGrafanaPanesJSON(typeof from === 'undefined' ? 'now-1h' : from, typeof to === 'undefined' ? 'now' : to, datasource, {refId:'A',expr:content.trim()}))}"
+        value: "https://${typeof grafanaHost === 'undefined' ? 'grafana.doordash.team' : grafanaHost}/explore?schemaVersion=1&panes=${encodeURIComponent(buildGrafanaPanesJSON(typeof from === 'undefined' ? 'now-1h' : from, typeof to === 'undefined' ? 'now' : to, datasourceUid, datasourceType, indexes, typeof limit === 'undefined' ? 3000 : limit, typeof filters === 'undefined' ? [] : filters))}"
     },
     GrafanaExploreSRTimestamp: {
         type: "link",
-        value: "https://${typeof grafanaHost === 'undefined' ? 'grafana.doordash.team' : grafanaHost}/explore?panes=${encodeURIComponent(buildGrafanaPanesJSON(grafanaFrom(), grafanaTo(), datasource, {refId:'A',expr:content.trim()}))}"
+        value: "https://${typeof grafanaHost === 'undefined' ? 'grafana.doordash.team' : grafanaHost}/explore?schemaVersion=1&panes=${encodeURIComponent(buildGrafanaPanesJSON(grafanaFrom(), grafanaTo(), datasourceUid, datasourceType, indexes, typeof limit === 'undefined' ? 3000 : limit, typeof filters === 'undefined' ? [] : filters))}"
     }
 };
 
@@ -2587,7 +2587,12 @@ function escapeHTMLStartTags(str){
 
 function getPrompts(content, tpl, variables){
     //inject srTimestamp prompt if you have it in your template/content and haven't overridden the start variable
-    if((tpl && tpl.includes("srTimestamp(")) || (content && content.includes("srTimestamp(")) && !nullSafe(variables).start){
+    const usesCloudWatchTimestamp = (tpl && tpl.includes("srTimestamp(")) || (content && content.includes("srTimestamp("));
+    const usesGrafanaTimestamp = (tpl && (tpl.includes("grafanaFrom(") || tpl.includes("grafanaTo("))) ||
+                                  (content && (content.includes("grafanaFrom(") || content.includes("grafanaTo(")));
+
+    if((usesCloudWatchTimestamp && !nullSafe(variables).start) ||
+       (usesGrafanaTimestamp && !nullSafe(variables).from)){
         content += getTimestampsPrompt();
     }
     const contentPrompts = [...content.matchAll(PROMPT_G)].map(x => ({location: 'content', prompt: x }));
@@ -2644,12 +2649,21 @@ function grafanaTo() {
     return timestamp.end || "now";
 }
 
-function buildGrafanaPanesJSON(from, to, datasource, query) {
+function buildGrafanaPanesJSON(from, to, datasourceUid, datasourceType, indexes, limit = 3000, filters = []) {
     const paneId = Math.random().toString(36).substring(7);
     return JSON.stringify({
         [paneId]: {
-            datasource: datasource,
-            queries: [query],
+            datasource: datasourceUid,
+            queries: [{
+                refId: "A",
+                datasource: {
+                    type: datasourceType,
+                    uid: datasourceUid
+                },
+                limit: limit,
+                indexes: indexes,
+                filters: filters
+            }],
             range: {from: from, to: to}
         }
     });
