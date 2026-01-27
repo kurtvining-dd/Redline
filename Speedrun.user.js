@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Speedrun
 // @namespace    https://speedrun.nobackspacecrew.com/
-// @version      1.151
+// @version      1.152
 // @description  Markdown to build tools
 // @author       No Backspace Crew
 // @require      https://speedrun.nobackspacecrew.com/js/jquery@3.7.1/jquery-3.7.1.min.js
@@ -39,6 +39,7 @@
 // @match        https://*.awsapps.com/start*
 // @match        https://grafana.doordash.team/*
 // @match        https://obs.doordash.team/*
+// @match        https://*.chronosphere.io/*
 // @connect      speedrun-api.us-west-2.nobackspacecrew.com
 // @connect      speedrun-api-beta.us-west-2.nobackspacecrew.com
 // @connect      lambda.us-east-1.amazonaws.com
@@ -1050,6 +1051,26 @@ function formatGrafanaFixedLabel(from, to) {
     }
 }
 
+// Chronosphere parsing functions
+function isChronosphereHost(hostname) {
+    return hostname.includes('chronosphere.io');
+}
+
+function extractChronosphereTimestamp(url) {
+    try {
+        const urlObj = new URL(url);
+        const from = urlObj.searchParams.get('from');
+        const to = urlObj.searchParams.get('to');
+
+        if (!from || !to) return null;
+
+        return { from, to };
+    } catch (error) {
+        console.log('Failed to parse Chronosphere URL:', error);
+        return null;
+    }
+}
+
 function getFormattedTimeUnit(relativeTimeInSeconds) {
     const rtf = new Intl.RelativeTimeFormat("en", { numeric: "auto" });
     let mapping = [{month:relativeTimeInSeconds/30/24/3600},
@@ -1274,6 +1295,40 @@ function extractGrafanaTimeAndAddSnapshot() {
     }
 }
 
+function extractChronosphereTimeAndAddSnapshot() {
+    // Check if we're on Chronosphere
+    if (!isChronosphereHost(window.location.hostname)) {
+        return;
+    }
+
+    // Extract timestamps (simpler than Grafana - direct query params)
+    let timeRange = extractChronosphereTimestamp(window.location.href);
+    if (!timeRange || !timeRange.from || !timeRange.to) {
+        return;
+    }
+
+    let timestamp = {};
+    timestamp.start = timeRange.from;
+    timestamp.end = timeRange.to;
+    timestamp.source = 'chronosphere';
+
+    // Determine if relative or fixed (same logic as Grafana)
+    if (timeRange.from.startsWith('now')) {
+        timestamp.type = 'relative';
+        // Reuse Grafana's label formatter
+        timestamp.label = `${formatGrafanaTimeLabel(timeRange.from, timeRange.to)} (Chronosphere)`;
+    } else {
+        timestamp.type = 'fixed';
+        // Reuse Grafana's fixed label formatter
+        timestamp.label = `${formatGrafanaFixedLabel(timeRange.from, timeRange.to)} (Chronosphere)`;
+    }
+
+    if (timestamp.label) {
+        console.log(`Extracted ${timestamp.type} Chronosphere timestamp`, timestamp);
+        persistTimestamp(timestamp, TIMESTAMPS_KEY);
+    }
+}
+
 function isSRPage() {
     // omit page not found and marketing pages
     if($('#not-found-search,#register').length) {
@@ -1397,6 +1452,21 @@ if(location.host === 'grafana.doordash.team' || location.host === 'obs.doordash.
     } else {
         // Fallback: use popstate for older browsers
         window.addEventListener('popstate', extractGrafanaTimeAndAddSnapshot);
+    }
+}
+
+if(location.host.includes('chronosphere.io')) {
+    // Extract on initial load
+    extractChronosphereTimeAndAddSnapshot();
+
+    // Monitor URL changes (SPA navigation)
+    if (window.onurlchange === null) {
+        window.addEventListener('urlchange', (info) => {
+            extractChronosphereTimeAndAddSnapshot();
+        });
+    } else {
+        // Fallback: use popstate for older browsers
+        window.addEventListener('popstate', extractChronosphereTimeAndAddSnapshot);
     }
 }
 
@@ -1755,6 +1825,14 @@ let templates = {
     GrafanaExploreSRTimestamp: {
         type: "link",
         value: "https://${typeof grafanaHost === 'undefined' ? 'grafana.doordash.team' : grafanaHost}/explore?schemaVersion=1&panes=${encodeURIComponent(buildGrafanaPanesJSON(grafanaFrom(), grafanaTo(), datasourceUid, datasourceType, indexes, typeof limit === 'undefined' ? 3000 : limit, typeof filters === 'undefined' ? [] : filters))}"
+    },
+    ChronosphereDashboard: {
+        type: "link",
+        value: "https://${typeof chronosphereHost === 'undefined' ? 'doordash.chronosphere.io' : chronosphereHost}/dashboards/${dashboardId}?orgId=${typeof orgId === 'undefined' ? '1' : orgId}&from=${typeof from === 'undefined' ? 'now-1h' : from}&to=${typeof to === 'undefined' ? 'now' : to}${typeof refresh === 'undefined' ? '' : `&refresh=${refresh}`}${typeof dashboardVars === 'undefined' ? '' : '&' + Object.entries(dashboardVars).map((entry) => 'var-' + entry[0] + '=' + entry[1]).join('&')}"
+    },
+    ChronosphereDashboardSRTimestamp: {
+        type: "link",
+        value: "https://${typeof chronosphereHost === 'undefined' ? 'doordash.chronosphere.io' : chronosphereHost}/dashboards/${dashboardId}?orgId=${typeof orgId === 'undefined' ? '1' : orgId}&from=${chronosphereFrom()}&to=${chronosphereTo()}${typeof refresh === 'undefined' ? '' : `&refresh=${refresh}`}${typeof dashboardVars === 'undefined' ? '' : '&' + Object.entries(dashboardVars).map((entry) => 'var-' + entry[0] + '=' + entry[1]).join('&')}"
     }
 };
 
@@ -2590,9 +2668,12 @@ function getPrompts(content, tpl, variables){
     const usesCloudWatchTimestamp = (tpl && tpl.includes("srTimestamp(")) || (content && content.includes("srTimestamp("));
     const usesGrafanaTimestamp = (tpl && (tpl.includes("grafanaFrom(") || tpl.includes("grafanaTo("))) ||
                                   (content && (content.includes("grafanaFrom(") || content.includes("grafanaTo(")));
+    const usesChronosphereTimestamp = (tpl && (tpl.includes("chronosphereFrom(") || tpl.includes("chronosphereTo("))) ||
+                                       (content && (content.includes("chronosphereFrom(") || content.includes("chronosphereTo(")));
 
     if((usesCloudWatchTimestamp && !nullSafe(variables).start) ||
-       (usesGrafanaTimestamp && !nullSafe(variables).from)){
+       (usesGrafanaTimestamp && !nullSafe(variables).from) ||
+       (usesChronosphereTimestamp && !nullSafe(variables).from)){
         content += getTimestampsPrompt();
     }
     const contentPrompts = [...content.matchAll(PROMPT_G)].map(x => ({location: 'content', prompt: x }));
@@ -2629,6 +2710,10 @@ function srTimestamp(type="cloudwatch"){
         "grafana" : {
             "relative" : () => timestamp.start,
             "fixed" : () => timestamp.start
+        },
+        "chronosphere" : {
+            "relative" : () => timestamp.start,
+            "fixed" : () => timestamp.start
         }
     };
     let conversionFunction = nullSafe(conversionFunctionLookup[type])[timestamp.type];
@@ -2645,6 +2730,16 @@ function grafanaFrom() {
 }
 
 function grafanaTo() {
+    let timestamp = firstNonNull(sessionVariables.srTimestampValue, "{}");
+    return timestamp.end || "now";
+}
+
+function chronosphereFrom() {
+    let timestamp = firstNonNull(sessionVariables.srTimestampValue, "{}");
+    return timestamp.start || "now-1h";
+}
+
+function chronosphereTo() {
     let timestamp = firstNonNull(sessionVariables.srTimestampValue, "{}");
     return timestamp.end || "now";
 }
@@ -2757,6 +2852,8 @@ var exposedFunctions = {
     srTimestamp: srTimestamp,
     grafanaFrom: grafanaFrom,
     grafanaTo: grafanaTo,
+    chronosphereFrom: chronosphereFrom,
+    chronosphereTo: chronosphereTo,
     buildGrafanaPanesJSON: buildGrafanaPanesJSON,
     encodeCloudWatchInsightsParam: encodeCloudWatchInsightsParam,
     encodeCloudWatchURL: encodeCloudWatchURL,
