@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Speedrun
 // @namespace    https://speedrun.nobackspacecrew.com/
-// @version      1.152
+// @version      1.153
 // @description  Markdown to build tools
 // @author       No Backspace Crew
 // @require      https://speedrun.nobackspacecrew.com/js/jquery@3.7.1/jquery-3.7.1.min.js
@@ -1051,6 +1051,68 @@ function formatGrafanaFixedLabel(from, to) {
     }
 }
 
+// Monitor format conversion functions
+
+/**
+ * Converts monitor relative time format to Grafana/storage format
+ * Monitor: "1h" -> Storage: "now-1h"
+ * @param {string} monitorTime - Monitor format like "1h", "30m", "7d"
+ * @returns {string} - Grafana format like "now-1h"
+ */
+function convertMonitorTimeToGrafana(monitorTime) {
+    // Monitor format is just duration: "1h", "30m", etc.
+    // Storage format is: "now-1h", "now-30m", etc.
+    if (!monitorTime || monitorTime === 'now') {
+        return 'now';
+    }
+
+    // Check if already in Grafana format
+    if (monitorTime.startsWith('now')) {
+        return monitorTime;
+    }
+
+    // Check if it's a monitor relative format (e.g., "1h", "30m")
+    const monitorMatch = monitorTime.match(/^(\d+)([smhdw])$/);
+    if (monitorMatch) {
+        return `now-${monitorTime}`;
+    }
+
+    // Assume it's absolute (Unix milliseconds)
+    return monitorTime;
+}
+
+/**
+ * Converts Grafana/storage relative time format to monitor format
+ * Storage: "now-1h" -> Monitor: "1h"
+ * @param {string} grafanaTime - Grafana format like "now-1h"
+ * @returns {string} - Monitor format like "1h", or unchanged if absolute
+ */
+function convertGrafanaTimeToMonitor(grafanaTime) {
+    if (!grafanaTime || grafanaTime === 'now') {
+        return 'now';
+    }
+
+    // Check if it's Grafana relative format: "now-1h"
+    const grafanaMatch = grafanaTime.match(/^now-(\d+[smhdw])$/);
+    if (grafanaMatch) {
+        return grafanaMatch[1]; // Return just "1h"
+    }
+
+    // If absolute timestamp, return as-is
+    return grafanaTime;
+}
+
+/**
+ * Detects if a monitor time parameter is relative or absolute
+ * @param {string} timeParam - Time parameter from monitor URL
+ * @returns {boolean} - true if relative, false if absolute
+ */
+function isMonitorTimeRelative(timeParam) {
+    if (!timeParam) return false;
+    // Relative: matches pattern like "1h", "30m", "7d"
+    return /^\d+[smhdw]$/.test(timeParam);
+}
+
 // Chronosphere parsing functions
 function isChronosphereHost(hostname) {
     return hostname.includes('chronosphere.io');
@@ -1067,6 +1129,48 @@ function extractChronosphereTimestamp(url) {
         return { from, to };
     } catch (error) {
         console.log('Failed to parse Chronosphere URL:', error);
+        return null;
+    }
+}
+
+/**
+ * Checks if the current URL is a Chronosphere monitor page
+ * @param {string} pathname - URL pathname to check
+ * @returns {boolean} - true if monitor page
+ */
+function isChronosphereMonitor(pathname) {
+    return /^\/monitors\//.test(pathname);
+}
+
+/**
+ * Checks if the current URL is a Chronosphere dashboard page
+ * @param {string} pathname - URL pathname to check
+ * @returns {boolean} - true if dashboard page
+ */
+function isChronosphereDashboard(pathname) {
+    return /^\/dashboards\//.test(pathname);
+}
+
+/**
+ * Extracts timestamp from Chronosphere monitor URLs
+ * Monitor URLs use 'start' and 'end' params (vs 'from'/'to' for dashboards)
+ * @param {string} url - Monitor URL to parse
+ * @returns {Object|null} - {start, end} or null if invalid
+ */
+function extractChronosphereMonitorTimestamp(url) {
+    try {
+        const urlObj = new URL(url);
+        const start = urlObj.searchParams.get('start');
+
+        // start is required for monitors, end is optional
+        if (!start) return null;
+
+        // Get end parameter, default to current time if missing
+        let end = urlObj.searchParams.get('end');
+
+        return { start, end };
+    } catch (error) {
+        console.log('Failed to parse Chronosphere monitor URL:', error);
         return null;
     }
 }
@@ -1301,30 +1405,66 @@ function extractChronosphereTimeAndAddSnapshot() {
         return;
     }
 
-    // Extract timestamps (simpler than Grafana - direct query params)
-    let timeRange = extractChronosphereTimestamp(window.location.href);
-    if (!timeRange || !timeRange.from || !timeRange.to) {
+    const pathname = window.location.pathname;
+    const url = window.location.href;
+    let timeRange = null;
+    let pageType = null;
+
+    // Determine page type and extract appropriate timestamps
+    if (isChronosphereMonitor(pathname)) {
+        pageType = 'Monitor';
+        timeRange = extractChronosphereMonitorTimestamp(url);
+
+        if (!timeRange || !timeRange.start) {
+            return;
+        }
+
+        // Convert monitor format to storage format and handle missing end
+        const isRelative = isMonitorTimeRelative(timeRange.start);
+
+        if (isRelative) {
+            // Convert "1h" -> "now-1h"
+            timeRange.from = convertMonitorTimeToGrafana(timeRange.start);
+            // Handle missing end: default to "now"
+            timeRange.to = timeRange.end ? convertMonitorTimeToGrafana(timeRange.end) : 'now';
+        } else {
+            // Absolute time: use as-is
+            timeRange.from = timeRange.start;
+            // Handle missing end: default to current time in milliseconds
+            timeRange.to = timeRange.end || Date.now().toString();
+        }
+
+    } else if (isChronosphereDashboard(pathname)) {
+        pageType = 'Dashboard';
+        timeRange = extractChronosphereTimestamp(url);
+
+        if (!timeRange || !timeRange.from || !timeRange.to) {
+            return;
+        }
+    } else {
+        // Not a dashboard or monitor page
         return;
     }
 
+    // Build timestamp object using normalized format
     let timestamp = {};
     timestamp.start = timeRange.from;
     timestamp.end = timeRange.to;
     timestamp.source = 'chronosphere';
 
-    // Determine if relative or fixed (same logic as Grafana)
+    // Determine if relative or fixed (same logic as before)
     if (timeRange.from.startsWith('now')) {
         timestamp.type = 'relative';
         // Reuse Grafana's label formatter
-        timestamp.label = `${formatGrafanaTimeLabel(timeRange.from, timeRange.to)} (Chronosphere)`;
+        timestamp.label = `${formatGrafanaTimeLabel(timeRange.from, timeRange.to)} (Chronosphere ${pageType})`;
     } else {
         timestamp.type = 'fixed';
         // Reuse Grafana's fixed label formatter
-        timestamp.label = `${formatGrafanaFixedLabel(timeRange.from, timeRange.to)} (Chronosphere)`;
+        timestamp.label = `${formatGrafanaFixedLabel(timeRange.from, timeRange.to)} (Chronosphere ${pageType})`;
     }
 
     if (timestamp.label) {
-        console.log(`Extracted ${timestamp.type} Chronosphere timestamp`, timestamp);
+        console.log(`Extracted ${timestamp.type} Chronosphere ${pageType} timestamp`, timestamp);
         persistTimestamp(timestamp, TIMESTAMPS_KEY);
     }
 }
@@ -1833,6 +1973,14 @@ let templates = {
     ChronosphereDashboardSRTimestamp: {
         type: "link",
         value: "https://${typeof chronosphereHost === 'undefined' ? 'doordash.chronosphere.io' : chronosphereHost}/dashboards/${dashboardId}?orgId=${typeof orgId === 'undefined' ? '1' : orgId}&from=${chronosphereFrom()}&to=${chronosphereTo()}${typeof refresh === 'undefined' ? '' : `&refresh=${refresh}`}${typeof dashboardVars === 'undefined' ? '' : '&' + Object.entries(dashboardVars).map((entry) => 'var-' + entry[0] + '=' + entry[1]).join('&')}"
+    },
+    ChronosphereMonitor: {
+        type: "link",
+        value: "https://${typeof chronosphereHost === 'undefined' ? 'doordash.chronosphere.io' : chronosphereHost}/monitors/${monitorName}?start=${typeof start === 'undefined' ? '1h' : start}${typeof end === 'undefined' ? '' : `&end=${end}`}${typeof changeEventsParams === 'undefined' ? '' : `&change_events_params=${changeEventsParams}`}"
+    },
+    ChronosphereMonitorSRTimestamp: {
+        type: "link",
+        value: "https://${typeof chronosphereHost === 'undefined' ? 'doordash.chronosphere.io' : chronosphereHost}/monitors/${monitorName}?start=${chronosphereMonitorStart()}${(() => { const end = chronosphereMonitorEnd(); return end ? `&end=${end}` : ''; })()}${typeof changeEventsParams === 'undefined' ? '' : `&change_events_params=${changeEventsParams}`}"
     }
 };
 
@@ -2670,10 +2818,13 @@ function getPrompts(content, tpl, variables){
                                   (content && (content.includes("grafanaFrom(") || content.includes("grafanaTo(")));
     const usesChronosphereTimestamp = (tpl && (tpl.includes("chronosphereFrom(") || tpl.includes("chronosphereTo("))) ||
                                        (content && (content.includes("chronosphereFrom(") || content.includes("chronosphereTo(")));
+    const usesChronosphereMonitorTimestamp = (tpl && (tpl.includes("chronosphereMonitorStart(") || tpl.includes("chronosphereMonitorEnd("))) ||
+                                              (content && (content.includes("chronosphereMonitorStart(") || content.includes("chronosphereMonitorEnd(")));
 
     if((usesCloudWatchTimestamp && !nullSafe(variables).start) ||
        (usesGrafanaTimestamp && !nullSafe(variables).from) ||
-       (usesChronosphereTimestamp && !nullSafe(variables).from)){
+       (usesChronosphereTimestamp && !nullSafe(variables).from) ||
+       (usesChronosphereMonitorTimestamp && !nullSafe(variables).start)){
         content += getTimestampsPrompt();
     }
     const contentPrompts = [...content.matchAll(PROMPT_G)].map(x => ({location: 'content', prompt: x }));
@@ -2742,6 +2893,46 @@ function chronosphereFrom() {
 function chronosphereTo() {
     let timestamp = firstNonNull(sessionVariables.srTimestampValue, "{}");
     return timestamp.end || "now";
+}
+
+/**
+ * Returns monitor start parameter in monitor format
+ * Converts from storage format "now-1h" to monitor format "1h"
+ * @returns {string} - Monitor start parameter
+ */
+function chronosphereMonitorStart() {
+    let timestamp = firstNonNull(sessionVariables.srTimestampValue, "{}");
+    const start = timestamp.start || "now-1h";
+
+    // Convert storage format to monitor format
+    if (timestamp.type === 'relative') {
+        return convertGrafanaTimeToMonitor(start);
+    }
+
+    // Absolute: return as-is (Unix milliseconds)
+    return start;
+}
+
+/**
+ * Returns monitor end parameter in monitor format (optional)
+ * @returns {string|undefined} - Monitor end parameter or undefined if not needed
+ */
+function chronosphereMonitorEnd() {
+    let timestamp = firstNonNull(sessionVariables.srTimestampValue, "{}");
+    const end = timestamp.end;
+
+    // For relative times ending at "now", omit the end parameter
+    if (!end || end === "now") {
+        return undefined;
+    }
+
+    // Convert storage format to monitor format
+    if (timestamp.type === 'relative') {
+        return convertGrafanaTimeToMonitor(end);
+    }
+
+    // Absolute: return as-is (Unix milliseconds)
+    return end;
 }
 
 function buildGrafanaPanesJSON(from, to, datasourceUid, datasourceType, indexes, limit = 3000, filters = []) {
@@ -2854,6 +3045,8 @@ var exposedFunctions = {
     grafanaTo: grafanaTo,
     chronosphereFrom: chronosphereFrom,
     chronosphereTo: chronosphereTo,
+    chronosphereMonitorStart: chronosphereMonitorStart,
+    chronosphereMonitorEnd: chronosphereMonitorEnd,
     buildGrafanaPanesJSON: buildGrafanaPanesJSON,
     encodeCloudWatchInsightsParam: encodeCloudWatchInsightsParam,
     encodeCloudWatchURL: encodeCloudWatchURL,
