@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Speedrun
 // @namespace    https://speedrun.nobackspacecrew.com/
-// @version      1.153
+// @version      1.154
 // @description  Markdown to build tools
 // @author       No Backspace Crew
 // @require      https://speedrun.nobackspacecrew.com/js/jquery@3.7.1/jquery-3.7.1.min.js
@@ -1198,7 +1198,7 @@ function getBackgroundColor() {
 
 function getTimestampsPrompt() {
     let timestamps = GM_getValue(TIMESTAMPS_KEY,[]);
-    let lastHour = { label: "last hour", type: "relative", start: "-3600", end:"0" };
+    let lastHour = { label: "last hour", type: "relative", start: "now-1h", end:"now" };
     //If you have accessed a timestamp <= 1 hour ago, push last hour to end of list, otherwise put it on front
     if(timestamps.length && dayjs(timestamps[0].timestamp).diff(dayjs(),'hour') < 0) {
         timestamps.unshift(lastHour);
@@ -2855,7 +2855,22 @@ function srTimestamp(type="cloudwatch"){
     //A mapping of type to a function to convert a timestamp into the correct format.
     let conversionFunctionLookup = {
         "cloudwatch" : {
-            "relative" : () => `end~${timestamp.end}~start~${timestamp.start}~timeType~'RELATIVE~unit~'seconds`,
+            "relative" : () => {
+                // Convert "now-1h" format to seconds for CloudWatch
+                let start = timestamp.start;
+                let end = timestamp.end;
+
+                // If start is in "now-X" format, convert to seconds
+                if (typeof start === 'string' && start.startsWith('now')) {
+                    start = parseGrafanaDuration(start).toString();
+                }
+                // If end is in "now-X" format, convert to seconds
+                if (typeof end === 'string' && end.startsWith('now')) {
+                    end = parseGrafanaDuration(end).toString();
+                }
+
+                return `end~${end}~start~${start}~timeType~'RELATIVE~unit~'seconds`;
+            },
             "fixed" : () => `end~'${timestamp.end.replace(/(:\d\d)Z/,"$1.999Z")}~start~'${timestamp.start.replace(/(:\d\d)Z/,"$1.000Z")}~timeType~'ABSOLUTE~tz~'UTC`
         },
         "grafana" : {
